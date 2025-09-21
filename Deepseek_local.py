@@ -1,11 +1,46 @@
 import os
+import sys
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, simpledialog, messagebox, filedialog, ttk
-from openai import OpenAI
 import json
+from datetime import datetime
 
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
+
+# Instalación automática de dependencias
+def instalar_dependencias():
+    try:
+        import openai
+        import tkinter
+        import fpdf
+    except ImportError:
+        import subprocess
+        pkgs = ["openai", "fpdf"]
+        for pkg in pkgs:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        # Confirmación en settings
+        settings = {}
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        settings["dependencias_instaladas"] = True
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+
+# Llama a instalar_dependencias solo la primera vez
+def check_dependencias():
+    if os.path.exists(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            if settings.get("dependencias_instaladas"):
+                return
+        except Exception:
+            pass
+    instalar_dependencias()
+
+check_dependencias()
 
 def get_conversaciones_dir():
     """Obtiene la ruta de la carpeta conversaciones desde settings.json o pregunta al usuario."""
@@ -74,6 +109,62 @@ def seleccionar_historial(conversaciones_dir):
                 json.dump([], f)
     return historial_path
 
+def seleccionar_ia_y_key():
+    ia_opciones = ["Deepseek", "ChatGPT"]
+    root = tk.Tk()
+    root.title("Seleccionar IA")
+    root.geometry("300x160")
+    tk.Label(root, text="Elija una IA:").pack(pady=6)
+    ia_var = tk.StringVar(value=ia_opciones[0])
+    combo = ttk.Combobox(root, textvariable=ia_var, values=ia_opciones, state="readonly")
+    combo.pack(pady=4)
+    key_var = tk.StringVar()
+    tk.Label(root, text="API Key:").pack()
+    key_entry = tk.Entry(root, textvariable=key_var, show="*")
+    key_entry.pack(pady=2)
+    result = {"ia": None, "key": None}
+    def confirmar():
+        result["ia"] = ia_var.get()
+        result["key"] = key_var.get()
+        root.quit()
+    btn = tk.Button(root, text="Aceptar", command=confirmar)
+    btn.pack(pady=6)
+    root.protocol("WM_DELETE_WINDOW", root.quit)
+    root.mainloop()
+    root.destroy()
+    return result["ia"], result["key"]
+
+def get_settings():
+    settings = {}
+    if os.path.exists(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception:
+            pass
+    return settings
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except Exception:
+        pass
+
+def get_api_key_and_ia():
+    settings = get_settings()
+    ia = settings.get("ia_seleccionada")
+    api_keys = settings.get("api_keys", {})
+    key = api_keys.get(ia)
+    if not ia or not key:
+        ia, key = seleccionar_ia_y_key()
+        if "api_keys" not in settings:
+            settings["api_keys"] = {}
+        settings["api_keys"][ia] = key
+        settings["ia_seleccionada"] = ia
+        save_settings(settings)
+    return ia, settings["api_keys"]
+
 # === Configuración ===
 BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
@@ -112,7 +203,8 @@ def get_api_key():
     return api_key
 
 class DeepSeekChat:
-    def __init__(self, api_key, base_url=BASE_URL, model=DEFAULT_MODEL):
+    def __init__(self, api_key, base_url, model):
+        from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.messages = [{"role": "system", "content": "Eres un asistente útil y expresivo."}]
@@ -137,7 +229,7 @@ class DeepSeekChat:
         return reply_accum
 
 class ChatApp:
-    def __init__(self, parent, bot: DeepSeekChat, historial_path, notebook=None, tab_frame=None):
+    def __init__(self, parent, bot, historial_path, notebook=None, tab_frame=None, ia_tipo="Deepseek", api_keys=None):
         self.parent = parent
         self.bot = bot
         self.historial_path = historial_path
@@ -150,6 +242,8 @@ class ChatApp:
         self.reply_label = None
         self.renombrado = False  # Para saber si ya renombró el archivo y la pestaña
         self.titulo = None
+        self.ia_tipo = ia_tipo
+        self.api_keys = api_keys
 
         # Frame principal para la pestaña
         self.frame = tk.Frame(parent)
@@ -213,8 +307,9 @@ class ChatApp:
                         mensajes = []
                     for msg in mensajes:
                         if isinstance(msg, dict) and "author" in msg and "text" in msg:
+                            fecha_hora = msg.get("fecha_hora")
                             self.history.append(msg)
-                            self.append_chat(msg["author"], msg["text"], add_to_history=False)
+                            self.append_chat(msg["author"], msg["text"], add_to_history=False, fecha_hora=fecha_hora)
             except Exception as e:
                 messagebox.showwarning("Historial", f"No se pudo cargar el historial: {e}")
                 self.history = []
@@ -235,28 +330,39 @@ class ChatApp:
         except Exception as e:
             messagebox.showwarning("Historial", f"No se pudo guardar el historial: {e}")
 
-    def append_chat(self, author, text, tag=None, add_to_history=True):
-        """Agrega un bloque completo al chat."""
+    def append_chat(self, author, text, tag=None, add_to_history=True, fecha_hora=None):
         frame = tk.Frame(self.scrollable_frame, pady=2)
-        max_length = 2000  # Limite de caracteres por mensaje visualizado
+        max_length = 4096
         display_text = text[:max_length] + ("..." if len(text) > max_length else "")
-        if author == "DeepSeek":
+        # Fecha y hora
+        if fecha_hora is None:
+            fecha_hora = datetime.now().strftime("%d/%m/%y %H:%M:%S")
+        user_frame = tk.Frame(frame)
+        user_label = tk.Label(user_frame, text=author, font=("Segoe UI", 10, "bold"))
+        user_label.pack(side="left")
+        fecha_label = tk.Label(user_frame, text=fecha_hora, font=("Segoe UI", 8), bg="#e0e0e0", fg="#444", padx=6, pady=1)
+        fecha_label.pack(side="left", padx=(6,0))
+        # Botón copiar al lado de la fecha
+        if author == "DeepSeek" or author == "ChatGPT":
+            copy_btn = tk.Button(user_frame, text="📋 Copiar", command=lambda t=text: self.copy_message(t))
+            copy_btn.pack(side="left", padx=(6,0))
+        user_frame.pack(anchor="w")
+        # Mensaje
+        if author == "DeepSeek" or author == "ChatGPT":
             label = tk.Label(frame, text=display_text, anchor="w", font=("Segoe UI Emoji", 10),
                              bg="#f0f0ff", justify="left", wraplength=self.frame.winfo_width())
-            label.pack(side="left", fill="x", expand=True)
+            label.pack(side="top", fill="x", expand=True)
             self.label_widgets.append(label)
-            copy_btn = tk.Button(frame, text="📋 Copiar", command=lambda t=text: self.copy_message(t))
-            copy_btn.pack(side="right", padx=4)
             self.replies.append(text)
         else:
-            label = tk.Label(frame, text=f"{author}: {display_text}", anchor="w", font=("Segoe UI", 10),
+            label = tk.Label(frame, text=display_text, anchor="w", font=("Segoe UI", 10),
                              justify="left", wraplength=self.frame.winfo_width())
-            label.pack(side="left", fill="x", expand=True)
+            label.pack(side="top", fill="x", expand=True)
             self.label_widgets.append(label)
         frame.pack(fill="x", padx=2, pady=2)
         self.chat_canvas.yview_moveto(1)
         if add_to_history:
-            self.history.append({"author": author, "text": text})
+            self.history.append({"author": author, "text": text, "fecha_hora": fecha_hora})
 
         # Renombrar el archivo y la pestaña con cada pregunta del usuario
         if author == "Tú" and self.notebook is not None and self.tab_frame is not None:
@@ -283,60 +389,44 @@ class ChatApp:
             # Guarda el título original en el json y actualiza la pestaña
             self.titulo = texto_original
             self.notebook.tab(self.tab_frame, text=texto_original)
-        # ...existing code...
         self.chat_canvas.yview_moveto(1)
-        if add_to_history:
-            self.history.append({"author": author, "text": text})
-
-        # Renombrar el archivo y la pestaña si es la primera pregunta del usuario en un chat nuevo
-        if (author == "Tú" and not self.renombrado and len(self.history) == 1
-            and self.notebook is not None and self.tab_frame is not None):
-            # Sanitiza el texto para nombre de archivo
-            nombre = text.strip().replace(" ", "_")[:40]
-            nombre = "".join(c for c in nombre if c.isalnum() or c in ("_", "-"))
-            if not nombre:
-                nombre = "Chat"
-            nuevo_json = os.path.join(os.path.dirname(self.historial_path), f"{nombre}.json")
-            # Renombra el archivo físico
-            try:
-                os.rename(self.historial_path, nuevo_json)
-                self.historial_path = nuevo_json
-            except Exception as e:
-                messagebox.showwarning("Renombrar", f"No se pudo renombrar el historial: {e}")
-            # Renombra la pestaña
-            idx = self.notebook.tabs().index(str(self.tab_frame))
-            self.notebook.tab(self.tab_frame, text=nombre)
-            self.renombrado = True
 
     def start_reply(self, author):
-        """Crea un bloque vacío para rellenar durante el streaming."""
         self._in_streaming = True
         self.last_reply = ""
         self.reply_frame = tk.Frame(self.scrollable_frame, pady=2)
-        self.reply_label = tk.Label(self.reply_frame, text=f"{author}: ", anchor="w", font=("Segoe UI Emoji", 10), bg="#f0f0ff", justify="left", wraplength=650)
-        self.reply_label.pack(side="left", fill="x", expand=True)
-        self.reply_copy_btn = tk.Button(self.reply_frame, text="📋 Copiar", command=lambda: self.copy_message(self.last_reply))
-        self.reply_copy_btn.pack(side="right", padx=4)
+        reply_user_frame = tk.Frame(self.reply_frame)
+        fecha_hora = datetime.now().strftime("%d/%m/%y %H:%M:%S")
+        reply_label = tk.Label(reply_user_frame, text=f"{author}", font=("Segoe UI", 10, "bold"))
+        reply_label.pack(side="left")
+        fecha_label = tk.Label(reply_user_frame, text=fecha_hora, font=("Segoe UI", 8), bg="#e0e0e0", fg="#444", padx=6, pady=1)
+        fecha_label.pack(side="left", padx=(6,0))
+        self.reply_copy_btn = tk.Button(reply_user_frame, text="📋 Copiar", command=lambda: self.copy_message(self.last_reply))
+        self.reply_copy_btn.pack(side="left", padx=(6,0))
+        reply_user_frame.pack(anchor="w")
+        self.reply_label = tk.Label(self.reply_frame, text="", anchor="w", font=("Segoe UI Emoji", 10),
+                                   bg="#f0f0ff", justify="left", wraplength=self.frame.winfo_width())
+        self.reply_label.pack(side="top", fill="x", expand=True)
         self.reply_frame.pack(fill="x", padx=2, pady=2)
         self.chat_canvas.yview_moveto(1)
 
     def update_reply(self, text):
-        """Agrega texto al final de la última respuesta en streaming."""
+        max_length = 4096
         if self._in_streaming and self.reply_label:
             current = self.reply_label.cget("text")
-            self.reply_label.config(text=current + text)
-            self.last_reply += text
+            new_text = (current + text)[:max_length]
+            self.reply_label.config(text=new_text + ("..." if len(current + text) > max_length else ""))
+            self.last_reply = new_text
             self.chat_canvas.update_idletasks()
-            self.chat_canvas.yview_moveto(1)  # <-- scroll automático al final
+            self.chat_canvas.yview_moveto(1)
 
     def end_reply(self):
-        """Finaliza un bloque de streaming."""
         if self._in_streaming and self.reply_label:
             self.reply_label.config(text=self.reply_label.cget("text") + "\n\n")
             self._in_streaming = False
             self.replies.append(self.last_reply)
-            # Agrega el mensaje completo al historial
-            self.history.append({"author": "DeepSeek", "text": self.last_reply})
+            fecha_hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.history.append({"author": self.ia_tipo, "text": self.last_reply, "fecha_hora": fecha_hora})
 
     def on_send(self):
         """Envía el mensaje del usuario y lanza el hilo para la respuesta."""
@@ -344,16 +434,34 @@ class ChatApp:
         if not user_text:
             return
         self.input_text.delete("1.0", tk.END)
-        self.append_chat("Tú", user_text)
+        self.append_chat("Tú", user_text)  # fecha_hora se agrega automáticamente
         threading.Thread(target=self.get_reply, args=(user_text,), daemon=True).start()
 
     def get_reply(self, user_text):
         try:
             self.status_var.set("Respondiendo...")
-            self.start_reply("DeepSeek")
-            reply = self.bot.stream_chat(user_text, self.update_reply)
-            self.end_reply()
-            self.last_reply = reply
+            self.start_reply("DeepSeek" if self.ia_tipo == "Deepseek" else self.ia_tipo)
+            max_length = 4096
+            if self.ia_tipo == "Deepseek":
+                reply = self.bot.stream_chat(user_text, self.update_reply)
+                reply = reply[:max_length] + ("..." if len(reply) > max_length else "")
+                self.end_reply()
+                self.last_reply = reply
+            elif self.ia_tipo == "ChatGPT":
+                from openai import OpenAI
+                api_key = self.api_keys.get("ChatGPT")
+                client = OpenAI(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "user", "content": user_text},
+                    ]
+                )
+                reply = response.choices[0].message.content
+                reply = reply[:max_length] + ("..." if len(reply) > max_length else "")
+                self.update_reply(reply)
+                self.end_reply()
+                self.last_reply = reply
             self.status_var.set("Listo.")
         except Exception as e:
             self.append_chat("Error", str(e))
@@ -379,12 +487,34 @@ class ChatApp:
         new_wrap = event.width - 40 if event.width > 100 else 100
         for label in self.label_widgets:
             label.config(wraplength=new_wrap)
+        # También ajusta el reply_label si existe
+        if self.reply_label:
+            self.reply_label.config(wraplength=new_wrap)
 
 def main():
-    api_key = get_api_key()
+    ia, api_keys = get_api_key_and_ia()
+    api_key = api_keys.get(ia)
     if not api_key:
-        messagebox.showerror("Error", "No se ingresó una API Key de DeepSeek.")
+        messagebox.showerror("Error", "No se ingresó una API Key.")
         return
+
+    def crear_bot(ia, api_keys):
+        if ia == "Deepseek":
+            base_url = "https://api.deepseek.com"
+            model = "deepseek-chat"
+            return DeepSeekChat(api_keys["Deepseek"], base_url, model)
+        elif ia == "ChatGPT":
+            # No se usa DeepSeekChat, solo se pasa la key
+            return None
+        elif ia == "Copilot":
+            # No se usa DeepSeekChat, solo se pasa la key
+            return None
+        else:
+            base_url = "https://api.deepseek.com"
+            model = "deepseek-chat"
+            return DeepSeekChat(api_keys["Deepseek"], base_url, model)
+
+    bot = crear_bot(ia, api_keys)
 
     conversaciones_dir = get_conversaciones_dir()
     if not conversaciones_dir:
@@ -393,7 +523,6 @@ def main():
 
     archivos = [f for f in os.listdir(conversaciones_dir) if f.endswith(".json")]
     if not archivos:
-        # Si no hay archivos, crea uno totalmente nuevo con nombre incremental
         idx = 1
         while True:
             nuevo_nombre = f"Chat_nuevo_{idx}.json"
@@ -406,6 +535,76 @@ def main():
             idx += 1
     root = tk.Tk()
     root.title("DeepSeek Chat (Streaming)")
+
+    menubar = tk.Menu(root)
+    usuario_menu = tk.Menu(menubar, tearoff=0)
+    usuario_menu.add_command(label="Perfil de usuario", command=lambda: messagebox.showinfo("Usuario", "Función de perfil de usuario"))
+    menubar.add_cascade(label="Usuario", menu=usuario_menu)
+
+    def seleccionar_ia_desde_menu(ia_seleccionada):
+        settings = get_settings()
+        api_keys = settings.get("api_keys", {})
+        key = api_keys.get(ia_seleccionada)
+        if not key:
+            key = simpledialog.askstring("API Key", f"Ingrese la API Key para {ia_seleccionada}:", show='*')
+            if "api_keys" not in settings:
+                settings["api_keys"] = {}
+            settings["api_keys"][ia_seleccionada] = key
+            save_settings(settings)
+        settings["ia_seleccionada"] = ia_seleccionada
+        save_settings(settings)
+        for app in chat_apps:
+            app.ia_tipo = ia_seleccionada
+            app.api_keys = settings["api_keys"]
+            if ia_seleccionada == "Deepseek":
+                app.bot = crear_bot("Deepseek", settings["api_keys"])
+            else:
+                app.bot = None
+        messagebox.showinfo("IA", f"IA seleccionada: {ia_seleccionada}\nKey guardada.")
+
+    ia_menu = tk.Menu(menubar, tearoff=0)
+    ia_menu.add_command(label="Deepseek", command=lambda: seleccionar_ia_desde_menu("Deepseek"))
+    ia_menu.add_command(label="ChatGPT", command=lambda: seleccionar_ia_desde_menu("ChatGPT"))
+    menubar.add_cascade(label="IA Prompt", menu=ia_menu)
+
+    def actualizar_key():
+        ia_opciones = ["Deepseek", "ChatGPT"]
+        root_cfg = tk.Toplevel(root)
+        root_cfg.title("Actualizar Key")
+        root_cfg.geometry("300x160")
+        tk.Label(root_cfg, text="Seleccione la IA:").pack(pady=6)
+        ia_var = tk.StringVar(value=ia_opciones[0])
+        combo = ttk.Combobox(root_cfg, textvariable=ia_var, values=ia_opciones, state="readonly")
+        combo.pack(pady=4)
+        key_var = tk.StringVar()
+        tk.Label(root_cfg, text="Nueva API Key:").pack()
+        key_entry = tk.Entry(root_cfg, textvariable=key_var, show="*")
+        key_entry.pack(pady=2)
+        def confirmar():
+            ia_sel = ia_var.get()
+            nueva_key = key_var.get()
+            settings = get_settings()
+            if "api_keys" not in settings:
+                settings["api_keys"] = {}
+            settings["api_keys"][ia_sel] = nueva_key
+            save_settings(settings)
+            for app in chat_apps:
+                app.api_keys = settings["api_keys"]
+                if app.ia_tipo == ia_sel and ia_sel == "Deepseek":
+                    app.bot = crear_bot("Deepseek", settings["api_keys"])
+            messagebox.showinfo("Configuración", f"Key de {ia_sel} actualizada.")
+            root_cfg.destroy()
+        btn = tk.Button(root_cfg, text="Actualizar", command=confirmar)
+        btn.pack(pady=6)
+        root_cfg.protocol("WM_DELETE_WINDOW", root_cfg.destroy)
+        root_cfg.mainloop()
+
+    ajustes_menu = tk.Menu(menubar, tearoff=0)
+    ajustes_menu.add_separator()
+    ajustes_menu.add_command(label="Actualizar Key", command=actualizar_key)
+    ajustes_menu.add_command(label="Configuración", command=lambda: messagebox.showinfo("Ajustes", "Función de configuración"))
+    menubar.add_cascade(label="Ajustes", menu=ajustes_menu)
+    root.config(menu=menubar)
 
     # Frame para los botones de pestañas
     tabs_btn_frame = tk.Frame(root)
@@ -421,7 +620,12 @@ def main():
                     json.dump([], f)
                 break
             idx += 1
-        chat_app = ChatApp(notebook, bot, historial_path, notebook, None)
+        # Usa la IA y key actual
+        current_settings = get_settings()
+        ia_actual = current_settings.get("ia_seleccionada", "Deepseek")
+        api_keys_actual = current_settings.get("api_keys", {})
+        bot_actual = crear_bot(ia_actual, api_keys_actual)
+        chat_app = ChatApp(notebook, bot_actual, historial_path, notebook, None, ia_tipo=ia_actual, api_keys=api_keys_actual)
         tab_text = "Chat nuevo"
         tab_frame = chat_app.frame
 
@@ -444,7 +648,6 @@ def main():
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
 
-    bot = DeepSeekChat(api_key)
     chat_apps = []
     tab_frames = []
 
@@ -462,7 +665,7 @@ def main():
 
     for i, archivo in enumerate(archivos):
         historial_path = os.path.join(conversaciones_dir, archivo)
-        chat_app = ChatApp(notebook, bot, historial_path, notebook, None)
+        chat_app = ChatApp(notebook, bot, historial_path, notebook, None, ia_tipo=ia, api_keys=api_keys)
         tab_frame = chat_app.frame
         tab_text = chat_app.titulo if chat_app.titulo else archivo.replace(".json", "")
 
